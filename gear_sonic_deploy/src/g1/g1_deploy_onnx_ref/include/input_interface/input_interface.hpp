@@ -30,9 +30,11 @@
 #define INPUT_INTERFACE_HPP
 
 #include <unistd.h>
+#include <array>
 #include <atomic>
 #include <queue>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include "../utils.hpp"              // For DataBuffer  
 #include "../robot_parameters.hpp"   // For HeadingState, OperatorState
@@ -135,6 +137,11 @@ public:
     /// @return True if this interface provides Dex3 hand joint targets (7 DOF per hand).
     virtual bool HasHandJoints() const {
       return has_hand_joints_;
+    }
+
+    /// @return True if this interface provides direct wrist joint targets (roll/pitch/yaw per wrist).
+    virtual bool HasWristJoints() const {
+      return has_wrist_joints_;
     }
     
     /// @return True if an external token-state vector is available (e.g. from ROS2/ZMQ).
@@ -390,6 +397,24 @@ public:
         return {false, {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
     }
 
+    /// @brief Get wrist joint override targets [left roll/pitch/yaw, right roll/pitch/yaw].
+    virtual std::pair<bool, std::array<double, 6>> GetWristJointTargets() const {
+        if(!has_wrist_joints_) {
+            return {false, {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+        }
+        auto buffered_data = wrist_joint_targets_.GetDataWithTime();
+        if (buffered_data.data) {
+            return {true, *buffered_data.data};
+        }
+        return {false, {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+    }
+
+    /// @brief Set wrist joint override targets [left roll/pitch/yaw, right roll/pitch/yaw].
+    virtual void SetWristJointTargets(const std::array<double, 6>& targets) {
+        wrist_joint_targets_.SetData(targets);
+        has_wrist_joints_ = true;
+    }
+
     /// @brief Get the last update time of the input interface.
     virtual std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const {
         // Return empty optional as a default, implementers should override this if they have a timestamp
@@ -461,6 +486,7 @@ protected:
     std::atomic<bool> has_vr_3point_control_{false};  ///< VR 3-point tracking available.
     std::atomic<bool> has_vr_5point_control_{false};  ///< VR 5-point tracking available.
     std::atomic<bool> has_hand_joints_{false};        ///< Dex3 hand joint data available.
+    std::atomic<bool> has_wrist_joints_{false};       ///< Direct wrist roll/pitch/yaw targets available.
     std::atomic<bool> has_external_token_state_{false}; ///< External token-state vector available.
     std::atomic<bool> has_upper_body_control_{false}; ///< Upper-body 17-DOF targets available.
 
@@ -488,6 +514,9 @@ protected:
     DataBuffer<std::array<double, 7>> left_hand_joint_;
     /// Right-hand Dex3 joint positions (7 DOF).
     DataBuffer<std::array<double, 7>> right_hand_joint_;
+
+    /// Direct wrist joint override [left roll/pitch/yaw, right roll/pitch/yaw].
+    DataBuffer<std::array<double, 6>> wrist_joint_targets_;
     
     /// Arbitrary external token-state vector (e.g. latent codes from a remote model).
     DataBuffer<std::vector<double>> external_token_state_;

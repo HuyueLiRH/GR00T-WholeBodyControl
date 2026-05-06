@@ -19,6 +19,28 @@ fi
 
 # Detect system architecture for platform-specific setup
 ARCH=$(uname -m)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+prepend_ld_library_path() {
+    local dir="$1"
+    if [ -d "$dir" ]; then
+        case ":$LD_LIBRARY_PATH:" in
+            *":$dir:"*) ;;
+            *) export LD_LIBRARY_PATH="$dir:$LD_LIBRARY_PATH" ;;
+        esac
+    fi
+}
+
+if [[ "$CYCLONEDDS_URI" == file://* ]]; then
+    CYCLONEDDS_CONFIG_FILE="${CYCLONEDDS_URI#file://}"
+    if [ ! -f "$CYCLONEDDS_CONFIG_FILE" ]; then
+        unset CYCLONEDDS_URI
+        echo "ℹ️  Ignoring missing CycloneDDS config: $CYCLONEDDS_CONFIG_FILE"
+    fi
+fi
+
+UNITREE_DDS_LIB_DIR="$DEPLOY_ROOT/thirdparty/unitree_sdk2/thirdparty/lib/$ARCH"
 
 # Set up ONNX Runtime environment - check multiple possible locations
 ONNX_RUNTIME_PATHS=(
@@ -301,6 +323,15 @@ if [ -d "/opt/onnxruntime/lib" ]; then
     export LD_LIBRARY_PATH="/opt/onnxruntime/lib:$LD_LIBRARY_PATH"
 fi
 
+# Keep Unitree's CycloneDDS C and C++ runtime libraries paired. Sourcing ROS2
+# can put /opt/ros/humble/lib ahead of Unitree's libddsc, while the executable
+# still resolves libddscxx from Unitree. Mixing those two versions can crash
+# during DDS initialization.
+if [ -d "$UNITREE_DDS_LIB_DIR" ]; then
+    prepend_ld_library_path "$UNITREE_DDS_LIB_DIR"
+    echo "✅ Unitree DDS runtime libraries prioritized: $UNITREE_DDS_LIB_DIR"
+fi
+
 # Set up Git LFS (if not already done)
 if command -v git-lfs &> /dev/null; then
     git lfs install &> /dev/null
@@ -344,4 +375,3 @@ echo ""
 if [ -n "$BASH_VERSION" ]; then
     export PS1="(g1_deploy) $PS1"
 fi
-

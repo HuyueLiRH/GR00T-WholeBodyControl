@@ -201,6 +201,8 @@ class G1Deploy {
     bool has_upper_body_data_ = false;
     std::array<double, 17> upper_body_joint_positions_buffer_;
     std::array<double, 17> upper_body_joint_velocities_buffer_;
+    bool has_wrist_joint_override_data_ = false;
+    std::array<double, 6> wrist_joint_override_buffer_;
     std::vector<double> token_state_data_;  // Token buffer (size from config)
     
     // =========================================================================
@@ -323,6 +325,14 @@ class G1Deploy {
     // Default 1.0 allows full closure, use --max-close-ratio to limit
     // Keyboard controls (J/K) always available for runtime adjustment
     double initial_max_close_ratio_ = 1.0;
+
+    // Optional real-robot guard: blend upper-body policy commands from the
+    // measured pose when CONTROL first starts, preventing a hard first step.
+    double policy_start_ramp_sec_ = 0.0;
+    bool policy_start_ramp_active_ = false;
+    std::chrono::steady_clock::time_point policy_start_ramp_time_;
+    std::array<double, G1_NUM_MOTOR> policy_start_q_ = {};
+    std::string init_arm_pose_ = "default";
     
     // Track if vr_3point_compliance is observed by the policy
     // If false, adjusting compliance via keyboard has no effect on the policy
@@ -2156,7 +2166,9 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      double policy_start_ramp_sec = 0.0,
+      std::string init_arm_pose = "default")
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2174,12 +2186,17 @@ class G1Deploy {
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
+        policy_start_ramp_sec_(policy_start_ramp_sec),
+        init_arm_pose_(init_arm_pose),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
       
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
+      if (init_arm_pose_ != "default") {
+        std::cout << "[INFO] INIT arm pose: " << init_arm_pose_ << std::endl;
+      }
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
@@ -2715,6 +2732,14 @@ class G1Deploy {
       motor_command_buffer_.SetData(motor_command_tmp);
     }
 
+    double InitTargetAngle(int motor_index) const {
+      if ((init_arm_pose_ == "debug-ready" || init_arm_pose_ == "forearms-forward") &&
+          motor_index >= 15 && motor_index <= 28) {
+        return 0.0;
+      }
+      return default_angles[motor_index];
+    }
+
     /**
      * @brief INIT state handler: ramp the robot from its current pose to the
      *        default standing angles over `duration_` seconds (linear interpolation).
@@ -2731,8 +2756,9 @@ class G1Deploy {
       }
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        const double target_angle = InitTargetAngle(i);
         motor_command_tmp.tau_ff.at(i) = 0.0;
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i]);
+        motor_command_tmp.q_target.at(i) = static_cast<float>(target_angle);
         motor_command_tmp.dq_target.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
@@ -2742,8 +2768,9 @@ class G1Deploy {
         for (int i = 0; i < G1_NUM_MOTOR; i++) {
           double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
           double current_pos = ls->motor_state()[i].q();
+          const double target_angle = InitTargetAngle(i);
           motor_command_tmp.q_target.at(i) =
-              static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
+              static_cast<float>(current_pos * (1.0 - ratio) + target_angle * ratio);
         }
         dex3_hands_.close(true);
         dex3_hands_.close(false);
@@ -2970,6 +2997,7 @@ class G1Deploy {
       std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
+      std::tie(has_wrist_joint_override_data_, wrist_joint_override_buffer_) = input_interface_->GetWristJointTargets();
 
       auto last_update_time = input_interface_->GetLastUpdateTime();
       if (last_update_time.has_value()) {
@@ -3125,8 +3153,57 @@ class G1Deploy {
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
+      if (has_wrist_joint_override_data_) {
+        for (size_t i = 0; i < wrist_joint_mujoco_order_in_mujoco_index.size(); ++i) {
+          const int joint_idx = wrist_joint_mujoco_order_in_mujoco_index[i];
+          motor_command_tmp.q_target.at(joint_idx) =
+              static_cast<float>(default_angles[joint_idx] + wrist_joint_override_buffer_[i]);
+        }
+      }
+      ApplyPolicyStartRamp(motor_command_tmp);
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
+    }
+
+    void BeginPolicyStartRamp() {
+      if (policy_start_ramp_sec_ <= 1e-6) {
+        policy_start_ramp_active_ = false;
+        return;
+      }
+
+      const std::shared_ptr<const LowState_> ls = low_state_buffer_.GetDataWithTime().data;
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        policy_start_q_[i] = ls ? static_cast<double>(ls->motor_state()[i].q()) : default_angles[i];
+      }
+      policy_start_ramp_time_ = std::chrono::steady_clock::now();
+      policy_start_ramp_active_ = true;
+      std::cout << "[PolicyRamp] Upper-body policy command ramp enabled for "
+                << policy_start_ramp_sec_ << "s" << std::endl;
+    }
+
+    void ApplyPolicyStartRamp(MotorCommand& motor_command) {
+      if (!policy_start_ramp_active_ || policy_start_ramp_sec_ <= 1e-6) {
+        return;
+      }
+
+      const double elapsed = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - policy_start_ramp_time_).count();
+      if (elapsed >= policy_start_ramp_sec_) {
+        policy_start_ramp_active_ = false;
+        std::cout << "[PolicyRamp] Complete" << std::endl;
+        return;
+      }
+
+      const double ratio = std::clamp(elapsed / policy_start_ramp_sec_, 0.0, 1.0);
+      const double weight = ratio * ratio * (3.0 - 2.0 * ratio);
+
+      // Keep legs controlled by the policy for balance; soften waist + arms.
+      for (int i = 12; i < G1_NUM_MOTOR; ++i) {
+        const double policy_q = static_cast<double>(motor_command.q_target.at(i));
+        motor_command.q_target.at(i) =
+            static_cast<float>(policy_start_q_[i] * (1.0 - weight) + policy_q * weight);
+        motor_command.dq_target.at(i) = 0.0f;
+      }
     }
 
     /**
@@ -3828,6 +3905,7 @@ class G1Deploy {
               }
               warn_count++;
             }
+            BeginPolicyStartRamp();
             std::cout << "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state" << std::endl;
             program_state_ = ProgramState::CONTROL;
           }
@@ -4134,6 +4212,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --policy-start-ramp-sec <value>: blend waist/arm policy commands from measured pose for N seconds after start (default: 0)" << std::endl;
+    std::cout << "  --init-arm-pose <default|forearms-forward|debug-ready>: arm target during INIT; forearms-forward keeps shoulders/elbows/wrists at zero (default: default)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4177,6 +4257,8 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  double policy_start_ramp_sec = 0.0;
+  std::string init_arm_pose = "default";
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4406,6 +4488,37 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--policy-start-ramp-sec") {
+      if (i + 1 < argc) {
+        try {
+          policy_start_ramp_sec = std::stod(argv[i + 1]);
+          if (policy_start_ramp_sec < 0.0) {
+            std::cerr << "Error: --policy-start-ramp-sec must be non-negative" << std::endl;
+            exit(1);
+          }
+          std::cout << "[INFO] Policy start upper-body ramp: " << policy_start_ramp_sec << "s" << std::endl;
+        } catch (...) {
+          std::cerr << "Error: Invalid policy start ramp value: " << argv[i + 1] << std::endl;
+          exit(1);
+        }
+        i++;
+      } else {
+        std::cerr << "Error: --policy-start-ramp-sec requires a value argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--init-arm-pose") {
+      if (i + 1 < argc) {
+        init_arm_pose = argv[i + 1];
+        if (init_arm_pose != "default" && init_arm_pose != "forearms-forward" && init_arm_pose != "debug-ready") {
+          std::cerr << "Error: --init-arm-pose must be 'default', 'forearms-forward', or 'debug-ready'" << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] INIT arm pose requested: " << init_arm_pose << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --init-arm-pose requires a value argument" << std::endl;
+        exit(1);
+      }
     }
   }
 
@@ -4438,7 +4551,9 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    policy_start_ramp_sec,
+    init_arm_pose
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4465,4 +4580,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-
