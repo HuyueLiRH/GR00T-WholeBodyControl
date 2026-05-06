@@ -261,6 +261,7 @@ class ZMQManager : public InputInterface {
                   // Update hand joints control state based on this message
                   has_hand_joints_ = latest_planner_message_.left_hand_joints.has_value() || 
                                      latest_planner_message_.right_hand_joints.has_value();
+                  has_wrist_joints_ = latest_planner_message_.wrist_joints.has_value();
                 }
               }
             } else if (new_mode == ManagedMode::STREAMED_MOTION) {
@@ -335,6 +336,7 @@ class ZMQManager : public InputInterface {
         
         // Clear hand joints control state
         has_hand_joints_ = false;
+        has_wrist_joints_ = false;
         
         return;
       }
@@ -358,6 +360,7 @@ class ZMQManager : public InputInterface {
         
         // Clear hand joints control state
         has_hand_joints_ = false;
+        has_wrist_joints_ = false;
       }
 
       // Delegate based on current mode
@@ -590,6 +593,7 @@ class ZMQManager : public InputInterface {
           // Update hand joints control state based on this message
           has_hand_joints_ = latest_planner_message_.left_hand_joints.has_value() || 
                              latest_planner_message_.right_hand_joints.has_value();
+          has_wrist_joints_ = latest_planner_message_.wrist_joints.has_value();
 
           MovementState mode_state(
             latest_planner_message_.mode,
@@ -625,6 +629,7 @@ class ZMQManager : public InputInterface {
           has_upper_body_control_ = false;
 
           has_hand_joints_ = false;
+          has_wrist_joints_ = false;
 
           auto current_facing = movement_state_buffer.GetDataWithTime().data->facing_direction;
           MovementState idle_state(
@@ -649,11 +654,13 @@ class ZMQManager : public InputInterface {
         }
       }
 
-      if (has_vr_3point_control_ && !last_has_vr_3point_control_) {
-        std::cout << "[ZMQManager] VR 3-point control enabled" << std::endl;
+      if (has_vr_3point_control_) {
+        if (!last_has_vr_3point_control_) {
+          std::cout << "[ZMQManager] VR 3-point control enabled" << std::endl;
+        }
         std::lock_guard<std::mutex> lock(current_motion_mutex);
-        if (current_motion->GetEncodeMode() >= 0) {
-              current_motion->SetEncodeMode(1);
+        if (current_motion->GetEncodeMode() >= 0 && current_motion->GetEncodeMode() != 1) {
+          current_motion->SetEncodeMode(1);
         }
       }
       else if (!has_vr_3point_control_ && last_has_vr_3point_control_) {
@@ -775,6 +782,7 @@ class ZMQManager : public InputInterface {
       int speed_idx = -1, height_idx = -1;
       int upper_body_position_idx = -1, upper_body_velocity_idx = -1;
       int left_hand_joints_idx = -1, right_hand_joints_idx = -1;
+      int left_wrist_joints_idx = -1, right_wrist_joints_idx = -1;
       int vr_position_idx = -1, vr_orientation_idx = -1, vr_compliance_idx = -1;
 
       for (size_t i = 0; i < hdr.fields.size(); ++i) {
@@ -788,6 +796,8 @@ class ZMQManager : public InputInterface {
         else if (f.name == "upper_body_velocity") upper_body_velocity_idx = static_cast<int>(i);
         else if (f.name == "left_hand_joints") left_hand_joints_idx = static_cast<int>(i);
         else if (f.name == "right_hand_joints") right_hand_joints_idx = static_cast<int>(i);
+        else if (f.name == "left_wrist_joints") left_wrist_joints_idx = static_cast<int>(i);
+        else if (f.name == "right_wrist_joints") right_wrist_joints_idx = static_cast<int>(i);
         else if (f.name == "vr_position") vr_position_idx = static_cast<int>(i);
         else if (f.name == "vr_orientation") vr_orientation_idx = static_cast<int>(i);
         else if (f.name == "vr_compliance") vr_compliance_idx = static_cast<int>(i);
@@ -1004,6 +1014,55 @@ class ZMQManager : public InputInterface {
 
         // Push into right hand joint buffer
         right_hand_joint_.SetData(right_hand_joints_data);
+      }
+
+      // Optional: direct wrist joints (roll/pitch/yaw per wrist, radians)
+      if (left_wrist_joints_idx >= 0 || right_wrist_joints_idx >= 0) {
+        auto [has_existing_wrist_joints, wrist_joint_values] = GetWristJointTargets();
+        if (!has_existing_wrist_joints) {
+          wrist_joint_values = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        }
+
+        auto decode_wrist_joints = [&](int field_idx, int offset) {
+          const auto& wrist_buf = bufs[field_idx];
+          const auto& wrist_field = hdr.fields[field_idx];
+
+          int num_wrist_joints = 0;
+          if (wrist_field.shape.size() == 1 && wrist_field.shape[0] == 3) {
+            num_wrist_joints = 3;
+          } else if (wrist_field.shape.size() == 2 && wrist_field.shape[1] == 3) {
+            num_wrist_joints = 3;
+          }
+          if (num_wrist_joints != 3) {
+            std::cerr << "[ZMQManager] Invalid " << wrist_field.name << " shape" << std::endl;
+            return;
+          }
+
+          if (wrist_field.dtype == "f32") {
+            for (int i = 0; i < 3; ++i) {
+              float val;
+              std::memcpy(&val,
+                          static_cast<const uint8_t*>(wrist_buf.data) + i * sizeof(float),
+                          sizeof(float));
+              if (needs_swap) val = byte_swap(val);
+              wrist_joint_values[offset + i] = static_cast<double>(val);
+            }
+          } else {
+            for (int i = 0; i < 3; ++i) {
+              double val;
+              std::memcpy(&val,
+                          static_cast<const uint8_t*>(wrist_buf.data) + i * sizeof(double),
+                          sizeof(double));
+              if (needs_swap) val = byte_swap(val);
+              wrist_joint_values[offset + i] = val;
+            }
+          }
+        };
+
+        if (left_wrist_joints_idx >= 0) decode_wrist_joints(left_wrist_joints_idx, 0);
+        if (right_wrist_joints_idx >= 0) decode_wrist_joints(right_wrist_joints_idx, 3);
+        msg.wrist_joints = wrist_joint_values;
+        SetWristJointTargets(wrist_joint_values);
       }
 
       // Decode VR 3-point tracking data if present (9 doubles for position, 12 doubles for orientation, 3 doubles for compliance)

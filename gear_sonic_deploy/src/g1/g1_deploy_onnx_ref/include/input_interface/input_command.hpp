@@ -64,6 +64,8 @@ struct CommandMessage {
  *   - upper_body_velocity: float[17] – target upper-body joint velocities (rad/s)
  *   - left_hand_joints   : float[7]  – Dex3 left-hand joint positions
  *   - right_hand_joints  : float[7]  – Dex3 right-hand joint positions
+ *   - left_wrist_joints  : float[3]  – direct left wrist roll/pitch/yaw override
+ *   - right_wrist_joints : float[3]  – direct right wrist roll/pitch/yaw override
  *
  * The `timestamp` field is set locally on receipt and used for timeout
  * detection (planner messages older than ~1 s are considered stale).
@@ -95,6 +97,9 @@ struct PlannerMessage {
   /// Optional right-hand Dex3 joint positions (7 DOF).
   std::optional<std::array<double, 7>> right_hand_joints;
 
+  /// Optional direct wrist joint targets [left roll/pitch/yaw, right roll/pitch/yaw].
+  std::optional<std::array<double, 6>> wrist_joints;
+
   /// Desired locomotion speed.  -1.0 means "use the default for the current mode".
   double speed = -1.0;
 
@@ -105,4 +110,3 @@ struct PlannerMessage {
   /// Used to detect planner timeouts (stale data → fallback to IDLE).
   std::chrono::steady_clock::time_point timestamp{};
 };
-
